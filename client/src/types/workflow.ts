@@ -21,7 +21,17 @@ export type WorkflowNodeKind =
   | "iteration"
   | "output";
 
-export type ConditionOperator = "equals" | "contains";
+export type ConditionOperator =
+  | "equals"
+  | "not_equals"
+  | "contains"
+  | "not_contains"
+  | "gt"
+  | "gte"
+  | "lt"
+  | "lte"
+  | "empty"
+  | "not_empty";
 
 export type CodeOperation = "upper" | "lower" | "replace" | "concat";
 

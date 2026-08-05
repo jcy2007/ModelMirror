@@ -28,8 +28,13 @@ import {
   type WorkflowNodeKind,
 } from "../../types/workflow";
 import NodePalette from "./NodePalette";
+import { VariablePicker, type AvailableVariable } from "./VariablePicker";
 import WorkflowNodeCard from "./WorkflowNodeCard";
 import WorkflowRun from "./WorkflowRun";
+import {
+  autoLayout,
+  collectAvailableVariables,
+} from "../../utils/workflowVariables";
 
 const nodeTypes = {
   workflowNode: WorkflowNodeCard,
@@ -322,15 +327,53 @@ function loadDefinition(workflowId: string) {
 function Field({
   label,
   children,
+  hint,
+  optional = false,
 }: {
   label: string;
   children: React.ReactNode;
+  hint?: string;
+  optional?: boolean;
 }) {
   return (
     <label className="block">
-      <span className="text-xs font-semibold text-slate-300">{label}</span>
+      <span className="flex items-center gap-2 text-xs font-semibold text-slate-300">
+        {label}
+        {optional ? (
+          <span className="rounded-full border border-white/10 bg-white/[0.05] px-1.5 py-0.5 text-[10px] font-normal text-slate-500">
+            可选
+          </span>
+        ) : null}
+      </span>
+      {hint ? <p className="mt-1 text-[11px] leading-4 text-slate-500">{hint}</p> : null}
       <div className="mt-2">{children}</div>
     </label>
+  );
+}
+
+/** A collapsible "more options" section — progressive disclosure (n8n pattern). */
+function MoreOptions({
+  children,
+  label = "更多配置",
+}: {
+  children: React.ReactNode;
+  label?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2.5">
+      <button
+        className="flex w-full items-center justify-between text-xs font-semibold text-slate-400 transition hover:text-slate-200"
+        onClick={() => setOpen((current) => !current)}
+        type="button"
+      >
+        <span>{label}</span>
+        <span className={open ? "rotate-180 transition-transform" : "transition-transform"}>
+          ▾
+        </span>
+      </button>
+      {open ? <div className="mt-3 space-y-3">{children}</div> : null}
+    </div>
   );
 }
 
@@ -355,9 +398,11 @@ function isRegistryToolOption(value: unknown): value is RegistryToolOption {
 interface NodeConfigProps {
   node: WorkflowNode | null;
   onChange: (nodeId: string, data: Partial<WorkflowNodeData>) => void;
+  variables: AvailableVariable[];
+  onInsertVariable: (nodeId: string, field: string, variableName: string) => void;
 }
 
-function NodeConfig({ node, onChange }: NodeConfigProps) {
+function NodeConfig({ node, onChange, variables, onInsertVariable }: NodeConfigProps) {
   const [registryTools, setRegistryTools] = useState<RegistryToolOption[]>([]);
   const [registryToolsError, setRegistryToolsError] = useState("");
 
@@ -454,8 +499,14 @@ function NodeConfig({ node, onChange }: NodeConfigProps) {
             </select>
           </Field>
           <Field label="提示词（支持 {{变量}}）">
+            <VariablePicker
+              onInsert={(name) =>
+                onInsertVariable(node.id, "prompt", name)
+              }
+              variables={variables}
+            />
             <textarea
-              className={`${textInputClass()} min-h-36 resize-none leading-6`}
+              className={`${textInputClass()} mt-2 min-h-36 resize-none leading-6`}
               onChange={(event) => update({ prompt: event.target.value })}
               value={data.prompt ?? ""}
             />
@@ -472,16 +523,28 @@ function NodeConfig({ node, onChange }: NodeConfigProps) {
 
       {data.kind === "condition" ? (
         <>
-          <Field label="判断变量">
+          <div className="rounded-lg border border-amber-300/25 bg-amber-300/10 px-3 py-2 text-xs leading-5 text-amber-50">
+            示例：判断「用户输入」是否「包含」「代码」——满足走“是”出口，否则走“否”出口。
+          </div>
+          <Field
+            hint="选择上游节点产出的变量，作为判断依据。"
+            label="判断变量"
+          >
+            <VariablePicker
+              onInsert={(name) =>
+                onInsertVariable(node.id, "conditionVariable", name)
+              }
+              variables={variables}
+            />
             <input
-              className={textInputClass()}
+              className={`${textInputClass()} mt-2`}
               onChange={(event) =>
                 update({ conditionVariable: event.target.value })
               }
               value={data.conditionVariable ?? ""}
             />
           </Field>
-          <Field label="判断方式">
+          <Field hint="按变量值与目标比较：数字支持大小判断，文本支持包含/等于。" label="判断方式">
             <select
               className={textInputClass()}
               onChange={(event) =>
@@ -494,12 +557,36 @@ function NodeConfig({ node, onChange }: NodeConfigProps) {
               <option className="bg-slate-950" value="contains">
                 包含
               </option>
+              <option className="bg-slate-950" value="not_contains">
+                不包含
+              </option>
               <option className="bg-slate-950" value="equals">
                 等于
               </option>
+              <option className="bg-slate-950" value="not_equals">
+                不等于
+              </option>
+              <option className="bg-slate-950" value="gt">
+                大于
+              </option>
+              <option className="bg-slate-950" value="gte">
+                大于等于
+              </option>
+              <option className="bg-slate-950" value="lt">
+                小于
+              </option>
+              <option className="bg-slate-950" value="lte">
+                小于等于
+              </option>
+              <option className="bg-slate-950" value="empty">
+                为空
+              </option>
+              <option className="bg-slate-950" value="not_empty">
+                不为空
+              </option>
             </select>
           </Field>
-          <Field label="比较值">
+          <Field hint="要匹配的目标内容。数字会按数值比较。“为空/不为空”时可不填。" label="比较值">
             <input
               className={textInputClass()}
               onChange={(event) => update({ conditionValue: event.target.value })}
@@ -586,16 +673,25 @@ function NodeConfig({ node, onChange }: NodeConfigProps) {
 
       {data.kind === "variable_assign" ? (
         <>
-          <Field label="写入变量名">
+          <div className="rounded-lg border border-fuchsia-300/25 bg-fuchsia-300/10 px-3 py-2 text-xs leading-5 text-fuchsia-50">
+            把模板内容加工后写入一个新变量，供下游节点引用。适合整理中间结果。
+          </div>
+          <Field hint="下游节点将用这个名字引用加工结果。" label="写入变量名">
             <input
               className={textInputClass()}
               onChange={(event) => update({ variableName: event.target.value })}
               value={data.variableName ?? ""}
             />
           </Field>
-          <Field label="赋值模板（支持 {{变量}}）">
+          <Field hint="可用 {{变量}} 引用上游内容，点击“插入变量”快速选择。" label="赋值模板">
+            <VariablePicker
+              onInsert={(name) =>
+                onInsertVariable(node.id, "template", name)
+              }
+              variables={variables}
+            />
             <textarea
-              className={`${textInputClass()} min-h-28 resize-none leading-6`}
+              className={`${textInputClass()} mt-2 min-h-28 resize-none leading-6`}
               onChange={(event) => update({ template: event.target.value })}
               value={data.template ?? ""}
             />
@@ -605,14 +701,23 @@ function NodeConfig({ node, onChange }: NodeConfigProps) {
 
       {data.kind === "template_transform" ? (
         <>
-          <Field label="模板内容（支持 {{变量}}）">
+          <div className="rounded-lg border border-lime-300/25 bg-lime-300/10 px-3 py-2 text-xs leading-5 text-lime-50">
+            把变量填入长文本模板，产出报告或结构化文本。适合生成段落类结果。
+          </div>
+          <Field hint="用 {{变量}} 引用上游内容，点击“插入变量”快速选择。" label="模板内容">
+            <VariablePicker
+              onInsert={(name) =>
+                onInsertVariable(node.id, "template", name)
+              }
+              variables={variables}
+            />
             <textarea
-              className={`${textInputClass()} min-h-36 resize-none leading-6`}
+              className={`${textInputClass()} mt-2 min-h-36 resize-none leading-6`}
               onChange={(event) => update({ template: event.target.value })}
               value={data.template ?? ""}
             />
           </Field>
-          <Field label="输出变量">
+          <Field hint="模板加工结果将写入这个变量，供下游引用。" label="输出变量">
             <input
               className={textInputClass()}
               onChange={(event) => update({ outputVariable: event.target.value })}
@@ -1247,6 +1352,31 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
     [nodes, selectedNodeId],
   );
 
+  const availableVariables = useMemo(
+    () => collectAvailableVariables(nodes),
+    [nodes],
+  );
+
+  const insertVariable = useCallback(
+    (nodeId: string, field: string, variableName: string) => {
+      setNodes((currentNodes) =>
+        currentNodes.map((node) => {
+          if (node.id !== nodeId) return node;
+          const current = String(node.data[field] ?? "");
+          const insertion = `{{${variableName}}}`;
+          const next = current
+            ? `${current}${insertion}`
+            : insertion;
+          return {
+            ...node,
+            data: { ...node.data, [field]: next },
+          };
+        }),
+      );
+    },
+    [setNodes],
+  );
+
   const handleConnect = useCallback(
     (connection: Connection) => {
       setEdges((currentEdges) =>
@@ -1306,6 +1436,18 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
     window.setTimeout(() => setSaveNotice(""), 1800);
   }
 
+  function applyAutoLayout() {
+    const positions = autoLayout(nodes, edges);
+    setNodes((currentNodes) =>
+      currentNodes.map((node) => ({
+        ...node,
+        position: positions[node.id] ?? node.position,
+      })),
+    );
+    setSaveNotice("已自动整理布局");
+    window.setTimeout(() => setSaveNotice(""), 1800);
+  }
+
   function onDrop(event: React.DragEvent<HTMLDivElement>) {
     event.preventDefault();
     const kind = event.dataTransfer.getData(
@@ -1360,6 +1502,13 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
             ) : null}
             <button
               className="rounded-full border border-white/10 bg-white/[0.06] px-4 py-2 text-sm font-semibold text-slate-100 transition hover:border-hire-300/40 hover:bg-hire-300/10 hover:text-hire-100"
+              onClick={applyAutoLayout}
+              type="button"
+            >
+              ↹ 自动整理布局
+            </button>
+            <button
+              className="rounded-full border border-white/10 bg-white/[0.06] px-4 py-2 text-sm font-semibold text-slate-100 transition hover:border-hire-300/40 hover:bg-hire-300/10 hover:text-hire-100"
               onClick={saveWorkflow}
               type="button"
             >
@@ -1377,10 +1526,17 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
           onDrop={onDrop}
         >
           <ReactFlow
+            deleteKeyCode={["Backspace", "Delete"]}
             edges={edges}
             fitView
             nodeTypes={nodeTypes}
             nodes={nodes}
+            onBeforeDelete={async ({ nodes: toDelete }) => {
+              if (toDelete.length === 0) return true;
+              return window.confirm(
+                `确认删除选中的 ${toDelete.length} 个节点吗？此操作不可撤销。`,
+              );
+            }}
             onConnect={handleConnect}
             onEdgesChange={handleEdgesChange}
             onNodeClick={(_, node) => setSelectedNodeId(node.id)}
@@ -1409,7 +1565,12 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
             节点配置会立即写入画布，下次运行直接生效。
           </p>
           <div className="mt-4">
-            <NodeConfig node={selectedNode} onChange={updateNodeData} />
+            <NodeConfig
+              node={selectedNode}
+              onChange={updateNodeData}
+              onInsertVariable={insertVariable}
+              variables={availableVariables}
+            />
           </div>
         </section>
 

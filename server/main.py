@@ -1131,12 +1131,47 @@ def get_workflow_task_or_none(task_id: str) -> dict[str, Any] | None:
     return task
 
 
+def apply_template_transform(variable_name: str, variables: dict[str, str]) -> str:
+    """Resolve a {{...}} expression, supporting built-in transform functions.
+
+    Supported syntax:
+      {{var_name}}              -> raw variable value
+      {{#to_upper:var_name}}    -> uppercase
+      {{#to_lower:var_name}}    -> lowercase
+      {{#trim:var_name}}        -> strip whitespace
+      {{#default:var_name:val}} -> value if non-empty else val
+
+    Unknown functions fall back to the raw value.
+    """
+
+    inner = variable_name.strip()
+    if inner.startswith("#"):
+        parts = inner.split(":", 2)
+        function_name = parts[0][1:].strip().lower()
+        target = parts[1].strip() if len(parts) > 1 else ""
+        value = variables.get(target, "")
+        if function_name == "to_upper":
+            return value.upper()
+        if function_name == "to_lower":
+            return value.lower()
+        if function_name == "trim":
+            return value.strip()
+        if function_name == "default":
+            fallback = parts[2] if len(parts) > 2 else ""
+            return value if value.strip() else fallback
+        return value
+    return variables.get(inner, "")
+
+
 def render_workflow_template(template: str, variables: dict[str, str]) -> str:
     def replace(match: re.Match[str]) -> str:
-        variable_name = match.group(1).strip()
-        return variables.get(variable_name, "")
+        return apply_template_transform(match.group(1).strip(), variables)
 
-    return re.sub(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", replace, template)
+    return re.sub(
+        r"\{\{\s*([A-Za-z_#][A-Za-z0-9_#:一-鿿]*)\s*\}\}",
+        replace,
+        template,
+    )
 
 
 def split_workflow_list(value: str) -> list[str]:
@@ -1200,6 +1235,78 @@ def workflow_topological_order(
         raise HTTPException(status_code=400, detail="工作流暂不支持循环，请移除环形连线。")
 
     return order
+
+
+def _try_number(value: str) -> float | None:
+    """Return a float when *value* parses as a number, else None."""
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def condition_equals(actual: str, expected: str) -> bool:
+    """Numeric-aware equality: when both sides parse as numbers, compare numerically."""
+
+    left = _try_number(actual)
+    right = _try_number(expected)
+    if left is not None and right is not None:
+        return left == right
+    return actual == expected
+
+
+def condition_matches(
+    operator: str,
+    actual: str,
+    expected: str,
+) -> bool:
+    """Evaluate a condition operator against (actual, expected).
+
+    Supported operators:
+      equals / eq      -> numeric-aware equality
+      not_equals / ne  -> numeric-aware inequality
+      contains         -> substring
+      not_contains     -> not substring
+      gt / gte / lt / lte -> numeric comparison (falls back to string compare)
+      empty            -> actual is empty/whitespace
+      not_empty        -> actual has content
+    """
+
+    op = operator.lower()
+    if op in {"equals", "eq"}:
+        return condition_equals(actual, expected)
+    if op in {"not_equals", "ne"}:
+        return not condition_equals(actual, expected)
+    if op == "contains":
+        return expected in actual
+    if op == "not_contains":
+        return expected not in actual
+    if op in {"gt", "gte", "lt", "lte"}:
+        left = _try_number(actual)
+        right = _try_number(expected)
+        if left is not None and right is not None:
+            if op == "gt":
+                return left > right
+            if op == "gte":
+                return left >= right
+            if op == "lt":
+                return left < right
+            return left <= right
+        # Non-numeric fallback: lexicographic compare
+        if op == "gt":
+            return actual > expected
+        if op == "gte":
+            return actual >= expected
+        if op == "lt":
+            return actual < expected
+        return actual <= expected
+    if op == "empty":
+        return not actual.strip()
+    if op == "not_empty":
+        return bool(actual.strip())
+    # Unknown operator -> treat as contains (backward compatible)
+    return expected in actual
 
 
 def run_safe_code_node(node: WorkflowNodePayload, variables: dict[str, str]) -> str:
@@ -1451,7 +1558,7 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
                     operator = str(node.data.get("conditionOperator") or "contains")
                     expected = str(node.data.get("conditionValue") or "")
                     actual = variables.get(variable_name, "")
-                    matched = actual == expected if operator == "equals" else expected in actual
+                    matched = condition_matches(operator, actual, expected)
                     chosen_handle = "true" if matched else "false"
                     output = f"{variable_name} {operator} {expected} -> {'是' if matched else '否'}"
 

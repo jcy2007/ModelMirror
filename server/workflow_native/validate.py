@@ -225,11 +225,22 @@ def validate_node_configuration(
                     node_id=node.id,
                 )
             )
-        if str(data.get("conditionOperator") or "").strip() not in {"equals", "contains"}:
+        if str(data.get("conditionOperator") or "").strip() not in {
+            "equals",
+            "not_equals",
+            "contains",
+            "not_contains",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "empty",
+            "not_empty",
+        }:
             issues.append(
                 ValidationIssue(
                     code="invalid_condition_operator",
-                    message="Condition node operator must be equals or contains.",
+                    message="Condition node operator is unsupported.",
                     node_id=node.id,
                 )
             )
