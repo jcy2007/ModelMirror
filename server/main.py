@@ -373,6 +373,9 @@ class WorkflowPayload(BaseModel):
 class WorkflowRunRequest(BaseModel):
     workflow: WorkflowPayload
     inputs: dict[str, str] = Field(default_factory=dict)
+    engine: str | None = Field(
+        default=None, max_length=16, pattern="^(serial|parallel)?$"
+    )
 
 
 class WorkflowResumeRequest(BaseModel):
@@ -1105,6 +1108,102 @@ def sse_payload(data: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+# ---------------------------------------------------------------------
+# E4-1: Node-event helpers
+# ---------------------------------------------------------------------
+# A node execution returns a list of event dicts (instead of yielding SSE
+# bytes directly). The scheduler collects them and emits them in order.
+# This decouples node execution from streaming, enabling parallel batches.
+WorkflowEvent = dict[str, Any]
+NodeEventList = list[WorkflowEvent]
+
+
+def node_start_event(node_id: str, title: str, kind: str) -> WorkflowEvent:
+    return {
+        "event": "node_start",
+        "node_id": node_id,
+        "node_title": title,
+        "node_type": kind,
+    }
+
+
+def node_delta_event(
+    node_id: str,
+    title: str,
+    kind: str,
+    output: str,
+    variable: str | None = None,
+) -> WorkflowEvent:
+    event: WorkflowEvent = {
+        "event": "node_delta",
+        "node_id": node_id,
+        "node_title": title,
+        "node_type": kind,
+        "output": output,
+    }
+    if variable:
+        event["variable"] = variable
+    return event
+
+
+def node_end_event(
+    node_id: str,
+    title: str,
+    kind: str,
+    output: str,
+    variables: dict[str, str],
+) -> WorkflowEvent:
+    return {
+        "event": "node_end",
+        "node_id": node_id,
+        "node_title": title,
+        "node_type": kind,
+        "output": output,
+        "variables": variables,
+    }
+
+
+def error_event(
+    node_id: str | None,
+    title: str | None,
+    kind: str | None,
+    message: str,
+) -> WorkflowEvent:
+    event: WorkflowEvent = {
+        "event": "error",
+        "message": message,
+    }
+    if node_id:
+        event["node_id"] = node_id
+    if title:
+        event["node_title"] = title
+    if kind:
+        event["node_type"] = kind
+    return event
+
+
+def run_input_events(
+    node: WorkflowNodePayload,
+    variables: dict[str, str],
+    variable_types: dict[str, str],
+) -> tuple[NodeEventList, str]:
+    """Execute an input node, returning (events, output).
+
+    Reads the declared variable from the input, registers its type, and
+    returns no node_start/end events (the scheduler emits those).
+    """
+
+    variable_name = str(node.data.get("variableName") or "user_input")
+    variables[variable_name] = variables.get(
+        variable_name,
+        variables.get("user_input", ""),
+    )
+    declared_type = str(node.data.get("variableType") or "string").strip()
+    if declared_type in {"string", "number", "object", "array"}:
+        variable_types[variable_name] = declared_type
+    return [], variables[variable_name]
+
+
 def cleanup_expired_workflow_tasks() -> None:
     """Remove stale paused workflow runs from the in-memory task store."""
 
@@ -1523,6 +1622,926 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
     }
     workflow_task_store[task_id] = task_state
 
+    # ------------------------------------------------------------------
+    # E4: Parallel engine v0 — input / condition / llm / output nodes.
+    # Enabled via WORKFLOW_ENGINE=parallel (default serial keeps old path).
+    # ------------------------------------------------------------------
+    def build_layers(
+        ordered: list[str],
+        edge_list: list[WorkflowEdgePayload],
+    ) -> list[list[str]]:
+        """Group nodes by topological depth so same-layer nodes are independent."""
+
+        depth: dict[str, int] = {}
+        for node_id in ordered:
+            incoming = [
+                edge.source
+                for edge in edge_list
+                if edge.target == node_id and edge.source in set(ordered)
+            ]
+            depth[node_id] = (max((depth.get(src, 0) + 1) for src in incoming)) if incoming else 0
+        layers: dict[int, list[str]] = {}
+        for node_id in ordered:
+            layers.setdefault(depth[node_id], []).append(node_id)
+        return [layers[d] for d in sorted(layers)]
+
+    async def run_workflow_parallel():
+        """Parallel engine: execute same-depth nodes concurrently via gather."""
+
+        variables: dict[str, str] = task_state["variables"]
+        variable_types: dict[str, str] = task_state["variable_types"]
+        final_output = ""
+        executed: set[str] = set()
+
+        async def run_node(node_id: str) -> tuple[NodeEventList, str, str | None]:
+            """Execute one node, return (events, output, chosen_handle)."""
+
+            node = nodes_by_id[node_id]
+            kind = workflow_node_kind(node)
+            title = workflow_node_title(node)
+            events: NodeEventList = [node_start_event(node_id, title, kind)]
+            output = ""
+            chosen_handle: str | None = None
+
+            if kind == "input":
+                _, output = run_input_events(node, variables, variable_types)
+            elif kind == "llm":
+                model_id = str(node.data.get("modelId") or TEXT_FALLBACK_MODEL)
+                prompt = render_workflow_template(
+                    str(node.data.get("prompt") or "{{user_input}}"),
+                    variables,
+                )
+                output_variable = str(
+                    node.data.get("outputVariable") or "llm_output"
+                )
+                output = ""
+                async for delta in stream_workflow_llm_text(model_id, prompt):
+                    output += delta
+                    events.append(
+                        node_delta_event(node_id, title, kind, delta, output_variable)
+                    )
+                variables[output_variable] = output
+            elif kind == "condition":
+                variable_name = str(
+                    node.data.get("conditionVariable") or "user_input"
+                )
+                operator = str(node.data.get("conditionOperator") or "contains")
+                expected = str(node.data.get("conditionValue") or "")
+                actual = variables.get(variable_name, "")
+                declared_type = variable_types.get(variable_name, "")
+                numeric_hint = declared_type == "number" or (
+                    infer_variable_type(actual) == "number"
+                )
+                matched = condition_matches(
+                    operator,
+                    actual,
+                    expected,
+                    numeric_hint=numeric_hint,
+                )
+                chosen_handle = "true" if matched else "false"
+                output = (
+                    f"{variable_name} {operator} {expected} -> "
+                    f"{'是' if matched else '否'}"
+                )
+            elif kind == "output":
+                output_variable = str(
+                    node.data.get("outputVariable") or "llm_output"
+                )
+                final_output_local = variables.get(output_variable, "")
+                output = final_output_local
+                nonlocal final_output
+                final_output = final_output_local
+            elif kind == "code":
+                output_variable = str(
+                    node.data.get("codeOutputVariable") or "code_output"
+                )
+                try:
+                    output = run_safe_code_node(node, variables)
+                    variables[output_variable] = output
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "variable_assign":
+                try:
+                    variable_name = str(
+                        node.data.get("variableName") or "assigned_text"
+                    )
+                    template = str(node.data.get("template") or "")
+                    output = render_workflow_template(template, variables)
+                    variables[variable_name] = output
+                    events.append(
+                        node_delta_event(node_id, title, kind, output, variable_name)
+                    )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "template_transform":
+                try:
+                    output_variable = str(
+                        node.data.get("outputVariable") or "template_output"
+                    )
+                    template = str(node.data.get("template") or "")
+                    output = render_workflow_template(template, variables)
+                    variables[output_variable] = output
+                    events.append(
+                        node_delta_event(node_id, title, kind, output[:200], output_variable)
+                    )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "variable_aggregator":
+                try:
+                    output_variable = str(
+                        node.data.get("outputVariable") or "aggregated_output"
+                    )
+                    variable_names = split_workflow_variable_names(
+                        str(node.data.get("variableNames") or "")
+                    )
+                    output_template = str(node.data.get("outputTemplate") or "")
+                    values = {name: variables.get(name, "") for name in variable_names}
+                    if output_template:
+                        output = "".join(
+                            output_template.replace("{name}", name).replace(
+                                "{value}", value
+                            )
+                            for name, value in values.items()
+                        )
+                    else:
+                        output = json.dumps(values, ensure_ascii=False)
+                    variables[output_variable] = output
+                    events.append(
+                        node_delta_event(node_id, title, kind, output, output_variable)
+                    )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "list_operation":
+                try:
+                    input_variable = str(
+                        node.data.get("inputVariable") or "user_input"
+                    )
+                    operator = str(node.data.get("operator") or "length")
+                    output_variable = str(
+                        node.data.get("outputVariable") or "list_output"
+                    )
+                    items = split_workflow_list(variables.get(input_variable, ""))
+                    if operator == "length":
+                        output = str(len(items))
+                    elif operator == "join":
+                        separator = str(node.data.get("joinSeparator") or "")
+                        output = separator.join(items)
+                    elif operator == "first":
+                        output = items[0] if items else ""
+                    elif operator == "last":
+                        output = items[-1] if items else ""
+                    else:
+                        raise ValueError(f"列表操作不支持：{operator}")
+                    variables[output_variable] = output
+                    events.append(
+                        node_delta_event(node_id, title, kind, output, output_variable)
+                    )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "time_tool":
+                try:
+                    output_variable = str(
+                        node.data.get("outputVariable") or "current_time"
+                    )
+                    operation = str(node.data.get("operation") or "now_iso").strip()
+                    format_string = str(
+                        node.data.get("formatString") or "%Y-%m-%d %H:%M:%S"
+                    )
+                    if operation == "now_iso":
+                        output = datetime.now().isoformat()
+                    elif operation == "now_epoch":
+                        output = str(int(time.time()))
+                    elif operation == "format":
+                        output = datetime.now().strftime(format_string)
+                    else:
+                        raise ValueError(f"时间工具操作不支持：{operation}")
+                    variables[output_variable] = output
+                    events.append(
+                        node_delta_event(node_id, title, kind, output[:200], output_variable)
+                    )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "http_request":
+                try:
+                    method = str(node.data.get("method") or "GET").upper()
+                    url = render_workflow_template(
+                        str(node.data.get("url") or ""),
+                        variables,
+                    )
+                    output_variable = str(
+                        node.data.get("outputVariable") or "http_output"
+                    )
+                    headers: dict[str, str] = {}
+                    headers_json = str(node.data.get("headersJson") or "").strip()
+                    if headers_json:
+                        try:
+                            parsed_headers = json.loads(headers_json)
+                            if isinstance(parsed_headers, dict):
+                                headers = {
+                                    str(key): str(value)
+                                    for key, value in parsed_headers.items()
+                                }
+                        except ValueError as exc:
+                            events.append(
+                                error_event(node_id, title, kind, f"headersJson 解析失败：{exc}")
+                            )
+                    body_variable = str(node.data.get("bodyVariable") or "").strip()
+                    body = (
+                        variables.get(body_variable, "") if body_variable else None
+                    )
+                    if not WORKFLOW_ALLOW_HTTP_OUTBOUND:
+                        output = (
+                            f"[http mock] method={method} url={url} "
+                            "status=200 body=mocked"
+                        )
+                        variables[output_variable] = output
+                        events.append(
+                            node_delta_event(
+                                node_id, title, kind, f"outbound disabled\n{output}", output_variable
+                            )
+                        )
+                    else:
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            response = await client.request(
+                                method,
+                                url,
+                                headers=headers,
+                                content=body if method == "POST" else None,
+                            )
+                        output = response.text
+                        if (
+                            response.status_code < 200
+                            or response.status_code >= 300
+                        ):
+                            events.append(
+                                error_event(
+                                    node_id,
+                                    title,
+                                    kind,
+                                    f"HTTP 请求失败：{response.status_code}",
+                                )
+                            )
+                        else:
+                            variables[output_variable] = output
+                            events.append(
+                                node_delta_event(node_id, title, kind, output, output_variable)
+                            )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "knowledge_retrieval":
+                try:
+                    output_variable = str(
+                        node.data.get("outputVariable") or "rag_context"
+                    )
+                    query_variable = str(node.data.get("queryVariable") or "user_input")
+                    query_text = variables.get(query_variable, "")
+                    try:
+                        top_k = int(str(node.data.get("top_k") or "3"))
+                    except ValueError:
+                        top_k = 3
+                    top_k = max(1, min(top_k, 20))
+                    service = RagService(llm_enabled=False)
+                    knowledge_bases = service.list_knowledge_bases()
+                    if not knowledge_bases:
+                        output = ""
+                        variables[output_variable] = output
+                        events.append(
+                            error_event(node_id, title, kind, "RAG 索引未就绪")
+                        )
+                    else:
+                        kb_id = str(knowledge_bases[0]["id"])
+                        result = await service.query(kb_id, query_text, top_k=top_k)
+                        sources = result.get("sources")
+                        if isinstance(sources, list):
+                            parts = [
+                                str(source.get("text") or "")
+                                for source in sources
+                                if isinstance(source, dict) and source.get("text")
+                            ]
+                        else:
+                            parts = []
+                        output = "\n---\n".join(parts)
+                        variables[output_variable] = output
+                        events.append(
+                            node_delta_event(
+                                node_id, title, kind, output or "RAG 未返回相关片段", output_variable
+                            )
+                        )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "document_extractor":
+                try:
+                    output_variable = str(
+                        node.data.get("outputVariable") or "document_text"
+                    )
+                    source_path_variable = str(
+                        node.data.get("sourcePathVariable") or "document_path"
+                    )
+                    raw_path = variables.get(source_path_variable, "")
+                    root = workflow_document_extractor_root()
+                    candidate = (root / raw_path).resolve()
+                    output = ""
+                    if not raw_path.strip():
+                        events.append(error_event(node_id, title, kind, "文档路径为空"))
+                    elif root != candidate and root not in candidate.parents:
+                        events.append(
+                            error_event(node_id, title, kind, "文档路径超出允许目录")
+                        )
+                    elif not candidate.exists() or not candidate.is_file():
+                        events.append(error_event(node_id, title, kind, "文档不存在"))
+                    else:
+                        try:
+                            output = parse_document(candidate, candidate.name)
+                        except Exception:
+                            output = candidate.read_text(encoding="utf-8")
+                        variables[output_variable] = output
+                        events.append(
+                            node_delta_event(node_id, title, kind, output[:500], output_variable)
+                        )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "parameter_extractor":
+                try:
+                    output_variable = str(
+                        node.data.get("outputVariable") or "parameters_json"
+                    )
+                    input_variable = str(node.data.get("inputVariable") or "user_input")
+                    schema = str(node.data.get("schema") or "")
+                    model_id = str(node.data.get("modelId") or TEXT_FALLBACK_MODEL)
+                    input_text = variables.get(input_variable, "")
+                    if not get_llm_gateway_config()[0]:
+                        output = "{}"
+                        variables[output_variable] = output
+                        events.append(
+                            node_delta_event(node_id, title, kind, "LLM gateway not configured; returned {}", output_variable)
+                        )
+                    else:
+                        prompt = (
+                            "请从以下文本中严格按 JSON 格式返回指定字段 "
+                            f"{schema}；若无法提取则返回空对象 {{}}。\n\n"
+                            f"文本：\n{input_text}"
+                        )
+                        raw_text = await collect_chat_completion_text(
+                            model_id,
+                            [ChatMessage(role="user", content=prompt)],
+                            temperature=0.3,
+                            max_tokens=1024,
+                        )
+                        json_text = extract_json_object_text(raw_text)
+                        if json_text:
+                            try:
+                                parsed = json.loads(json_text)
+                                output = json.dumps(parsed, ensure_ascii=False)
+                            except ValueError:
+                                output = raw_text
+                                events.append(
+                                    error_event(node_id, title, kind, "参数提取 JSON 解析失败")
+                                )
+                        else:
+                            output = raw_text
+                            events.append(
+                                error_event(node_id, title, kind, "参数提取未找到 JSON")
+                            )
+                        variables[output_variable] = output
+                        events.append(
+                            node_delta_event(node_id, title, kind, output, output_variable)
+                        )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "question_classifier":
+                try:
+                    output_variable = str(
+                        node.data.get("outputVariable") or "category"
+                    )
+                    default_category = str(node.data.get("defaultCategory") or "未知")
+                    input_variable = str(node.data.get("inputVariable") or "user_input")
+                    categories_json = str(node.data.get("categories") or "{}")
+                    match_mode = str(
+                        node.data.get("matchMode") or "contains_any"
+                    ).strip()
+                    case_sensitive = (
+                        str(node.data.get("caseSensitive") or "false")
+                        .strip()
+                        .lower()
+                        == "true"
+                    )
+                    use_llm_fallback = (
+                        str(node.data.get("useLlmFallback") or "false")
+                        .strip()
+                        .lower()
+                        == "true"
+                    )
+                    model_id = str(node.data.get("modelId") or "").strip()
+                    text = variables.get(input_variable, "")
+                    output = default_category
+                    try:
+                        raw_categories = json.loads(categories_json)
+                    except ValueError as exc:
+                        raise ValueError(f"分类规则 JSON 解析失败：{exc}") from exc
+                    if not isinstance(raw_categories, dict) or not raw_categories:
+                        raise ValueError("分类规则必须是非空 JSON 对象。")
+                    category_map: dict[str, list[str]] = {}
+                    for category_name, keywords in raw_categories.items():
+                        if not isinstance(category_name, str):
+                            raise ValueError("分类名称必须是字符串。")
+                        if not isinstance(keywords, list):
+                            raise ValueError("分类关键词必须是字符串数组。")
+                        clean_keywords = [
+                            str(keyword).strip()
+                            for keyword in keywords
+                            if isinstance(keyword, str) and keyword.strip()
+                        ]
+                        if not clean_keywords:
+                            raise ValueError(
+                                f"分类 {category_name} 至少需要一个关键词。"
+                            )
+                        category_map[category_name] = clean_keywords
+                    comparison_text = text if case_sensitive else text.lower()
+                    selected = ""
+                    matched_keyword = ""
+                    for category_name, keywords in category_map.items():
+                        comparison_keywords = (
+                            keywords
+                            if case_sensitive
+                            else [keyword.lower() for keyword in keywords]
+                        )
+                        if match_mode == "contains_all":
+                            matched = all(
+                                keyword in comparison_text
+                                for keyword in comparison_keywords
+                            )
+                            keyword_hint = ",".join(keywords)
+                        else:
+                            hit_index = next(
+                                (
+                                    index
+                                    for index, keyword in enumerate(
+                                        comparison_keywords
+                                    )
+                                    if keyword in comparison_text
+                                ),
+                                -1,
+                            )
+                            matched = hit_index >= 0
+                            keyword_hint = (
+                                keywords[hit_index] if hit_index >= 0 else ""
+                            )
+                        if matched:
+                            selected = category_name
+                            matched_keyword = keyword_hint
+                            break
+                    delta_output = ""
+                    if selected:
+                        output = selected
+                        delta_output = (
+                            f"已分类：{selected}（关键词命中：{matched_keyword}）"
+                        )
+                    elif use_llm_fallback:
+                        if not get_llm_gateway_config()[0] or not model_id:
+                            raise ValueError("LLM 回退未配置网关或 modelId。")
+                        fallback_prompt = str(
+                            node.data.get("llmFallbackPrompt") or ""
+                        ).strip()
+                        if fallback_prompt:
+                            prompt = render_workflow_template(
+                                fallback_prompt,
+                                variables,
+                            )
+                        else:
+                            prompt = (
+                                "请从下列文本中判断它属于哪个已知类别："
+                                f"{json.dumps(list(category_map.keys()), ensure_ascii=False)}。"
+                                "只回答类别名，不要多余文字或解释。如无法判断则回答 "
+                                '"未知"。\n\n文本：\n'
+                                f"{text}"
+                            )
+                        selected = (
+                            await collect_chat_completion_text(
+                                model_id,
+                                [ChatMessage(role="user", content=prompt)],
+                                temperature=0,
+                                max_tokens=20,
+                            )
+                        ).strip()
+                        output = selected or default_category
+                        delta_output = f"已分类：{output}（LLM 回退）"
+                    else:
+                        output = default_category
+                        delta_output = (
+                            f"规则未命中，返回默认类别：{default_category}"
+                        )
+                    variables[output_variable] = output
+                    events.append(
+                        node_delta_event(node_id, title, kind, delta_output, output_variable)
+                    )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "mcp_tool":
+                try:
+                    output_variable = str(
+                        node.data.get("outputVariable") or "mcp_output"
+                    )
+                    tool_name = str(node.data.get("toolName") or "").strip()
+                    if not WORKFLOW_MCP_TOOL_ENABLED or not tool_name:
+                        output = ""
+                        variables[output_variable] = output
+                        events.append(
+                            node_delta_event(node_id, title, kind, "mcp_tool 未启用或 toolName 为空", output_variable)
+                        )
+                    else:
+                        registered_tools = await tool_registry.list_tools()
+                        matched_tool = next(
+                            (
+                                tool
+                                for tool in registered_tools
+                                if str(tool.get("name") or "") == tool_name
+                            ),
+                            None,
+                        )
+                        if not matched_tool:
+                            raise ValueError(f"MCP 工具未注册：{tool_name}")
+                        session_id = str(matched_tool.get("session_id") or "")
+                        raw_arguments = render_workflow_template(
+                            str(node.data.get("argumentsJson") or "{}"),
+                            variables,
+                        )
+                        arguments = json.loads(raw_arguments)
+                        if not isinstance(arguments, dict):
+                            raise ValueError("MCP 工具参数必须是 JSON 对象。")
+                        call_result = await mcp_manager.call_tool(
+                            session_id,
+                            tool_name,
+                            arguments,
+                        )
+                        text_parts: list[str] = []
+                        non_text_types: list[str] = []
+                        for part in getattr(call_result, "content", []) or []:
+                            if isinstance(part, dict):
+                                part_type = str(part.get("type") or "other")
+                                part_text = part.get("text")
+                            else:
+                                part_type = str(getattr(part, "type", "other"))
+                                part_text = getattr(part, "text", None)
+                            if part_type == "text":
+                                text_parts.append(str(part_text or ""))
+                            else:
+                                non_text_types.append(part_type)
+                        output = "\n".join(text_parts).strip()
+                        variables[output_variable] = output
+                        if non_text_types:
+                            events.append(
+                                node_delta_event(
+                                    node_id, title, kind,
+                                    "非文本工具结果已省略：" + ", ".join(non_text_types),
+                                    output_variable,
+                                )
+                            )
+                        events.append(
+                            node_delta_event(node_id, title, kind, output[:300], output_variable)
+                        )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "iteration":
+                try:
+                    input_variable = str(node.data.get("inputVariable") or "user_input")
+                    iteration_variable = str(
+                        node.data.get("iterationVariable") or "item"
+                    )
+                    item_template = str(node.data.get("itemTemplate") or "{{item}}")
+                    output_variable = str(
+                        node.data.get("outputVariable") or "iteration_output"
+                    )
+                    items = split_workflow_list(variables.get(input_variable, ""))
+                    if len(items) > WORKFLOW_MAX_ITERATION_ITEMS:
+                        items = items[:WORKFLOW_MAX_ITERATION_ITEMS]
+                        events.append(
+                            node_delta_event(
+                                node_id, title, kind,
+                                f"truncated to {WORKFLOW_MAX_ITERATION_ITEMS} items",
+                                output_variable,
+                            )
+                        )
+                    results: list[str] = []
+                    for index, item in enumerate(items, start=1):
+                        variables[iteration_variable] = item
+                        result = render_workflow_template(item_template, variables)
+                        results.append(result)
+                        events.append(
+                            node_delta_event(
+                                node_id, title, kind,
+                                f"[{index}] {result}",
+                                output_variable,
+                            )
+                        )
+                    output = json.dumps(results, ensure_ascii=False)
+                    variables[output_variable] = output
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "agent":
+                output_variable = str(node.data.get("outputVariable") or "agent_output")
+                output = ""
+                try:
+                    if not WORKFLOW_AGENT_ENABLED:
+                        variables[output_variable] = output
+                        events.append(
+                            node_delta_event(node_id, title, kind, "agent 节点当前未启用。", output_variable)
+                        )
+                    else:
+                        agent_mode = str(
+                            node.data.get("agentMode") or "tool_first"
+                        ).strip()
+                        model_id = str(node.data.get("modelId") or "").strip()
+                        instruction = render_workflow_template(
+                            str(node.data.get("instruction") or ""),
+                            variables,
+                        ).strip()
+                        prompt_suffix = render_workflow_template(
+                            str(node.data.get("promptSuffix") or ""),
+                            variables,
+                        ).strip()
+                        if prompt_suffix:
+                            instruction = f"{instruction}\n\n{prompt_suffix}".strip()
+                        if not model_id:
+                            raise ValueError("Agent 节点缺少 modelId。")
+                        if not instruction:
+                            raise ValueError("Agent 节点缺少 instruction。")
+                        try:
+                            temperature = float(
+                                str(node.data.get("temperature") or "0.7")
+                            )
+                        except ValueError:
+                            temperature = 0.7
+                        temperature = min(max(temperature, 0.0), 2.0)
+                        try:
+                            max_iterations = int(
+                                str(
+                                    node.data.get("maxIterations")
+                                    or WORKFLOW_AGENT_MAX_ITERATIONS_DEFAULT
+                                )
+                            )
+                        except ValueError:
+                            max_iterations = WORKFLOW_AGENT_MAX_ITERATIONS_DEFAULT
+                        max_iterations = min(max(max_iterations, 1), 20)
+
+                        async def run_direct_agent() -> str:
+                            if not get_llm_gateway_config()[0]:
+                                raise ValueError(LLM_GATEWAY_NOT_CONFIGURED_MESSAGE)
+                            return await collect_chat_completion_text(
+                                model_id,
+                                [ChatMessage(role="user", content=instruction)],
+                                temperature=temperature,
+                                max_tokens=WORKFLOW_AGENT_MAX_TOKENS,
+                            )
+
+                        if agent_mode == "direct":
+                            output = await run_direct_agent()
+                            variables[output_variable] = output
+                            events.append(
+                                node_delta_event(node_id, title, kind, output[:500], output_variable)
+                            )
+                        elif agent_mode == "tool_first":
+                            registered_tools = await tool_registry.list_tools()
+                            requested_tool_names = [
+                                item.strip()
+                                for item in str(node.data.get("toolNames") or "").split(",")
+                                if item.strip()
+                            ]
+                            if requested_tool_names:
+                                allowed_names = set(requested_tool_names)
+                                available_tools = [
+                                    tool
+                                    for tool in registered_tools
+                                    if str(tool.get("name") or "") in allowed_names
+                                ]
+                            else:
+                                available_tools = registered_tools
+
+                            if not available_tools:
+                                events.append(
+                                    node_delta_event(
+                                        node_id, title, kind,
+                                        "Agent 切换为直接回答：没有可用 MCP 工具",
+                                        output_variable,
+                                    )
+                                )
+                                output = await run_direct_agent()
+                                variables[output_variable] = output
+                                events.append(
+                                    node_delta_event(node_id, title, kind, output[:500], output_variable)
+                                )
+                            else:
+                                tool_by_name = {
+                                    str(tool.get("name") or ""): tool
+                                    for tool in available_tools
+                                    if str(tool.get("name") or "")
+                                }
+                                tool_descriptions = "\n".join(
+                                    (
+                                        f"- {name}: "
+                                        f"{tool.get('description') or '无描述'} "
+                                        f"schema={json.dumps(tool.get('input_schema') or {}, ensure_ascii=False)}"
+                                    )
+                                    for name, tool in tool_by_name.items()
+                                )
+                                system_prompt = (
+                                    "你是模镜工作流中的 ReAct-Lite Agent。"
+                                    "你可以选择调用一个工具，或给出最终答案。"
+                                    "每次回复必须是 JSON，且只能使用以下两种格式之一："
+                                    '{"tool":"工具名","arguments":{...}} 或 {"answer":"最终答案"}。'
+                                    "不要输出 JSON 以外的文字。\n\n可用工具：\n"
+                                    f"{tool_descriptions}"
+                                )
+                                messages: list[ChatMessage] = [
+                                    ChatMessage(role="system", content=system_prompt),
+                                    ChatMessage(role="user", content=instruction),
+                                ]
+                                for iteration_index in range(max_iterations):
+                                    if not get_llm_gateway_config()[0]:
+                                        raise ValueError(LLM_GATEWAY_NOT_CONFIGURED_MESSAGE)
+                                    raw_response = (
+                                        await collect_chat_completion_text(
+                                            model_id,
+                                            messages,
+                                            temperature=temperature,
+                                            max_tokens=WORKFLOW_AGENT_MAX_TOKENS,
+                                        )
+                                    ).strip()
+                                    json_text = raw_response
+                                    fenced = re.search(
+                                        r"```(?:json)?\s*\n?(.*?)\n?```",
+                                        raw_response,
+                                        re.DOTALL,
+                                    )
+                                    if fenced:
+                                        json_text = fenced.group(1).strip()
+                                    try:
+                                        decision = json.loads(json_text)
+                                    except ValueError:
+                                        output = raw_response
+                                        break
+                                    if not isinstance(decision, dict):
+                                        output = raw_response
+                                        break
+                                    answer = decision.get("answer")
+                                    if isinstance(answer, str) and answer.strip():
+                                        output = answer.strip()
+                                        break
+                                    tool_name = str(decision.get("tool") or "").strip()
+                                    arguments = decision.get("arguments")
+                                    if not tool_name:
+                                        output = raw_response
+                                        break
+                                    if not isinstance(arguments, dict):
+                                        arguments = {}
+                                    matched_tool = tool_by_name.get(tool_name)
+                                    if not matched_tool:
+                                        tool_result_text = f"工具不可用：{tool_name}"
+                                        events.append(
+                                            node_delta_event(node_id, title, kind, tool_result_text, output_variable)
+                                        )
+                                    else:
+                                        call_result = await mcp_manager.call_tool(
+                                            str(matched_tool.get("session_id") or ""),
+                                            tool_name,
+                                            arguments,
+                                        )
+                                        text_parts: list[str] = []
+                                        non_text_types: list[str] = []
+                                        for part in getattr(call_result, "content", []) or []:
+                                            if isinstance(part, dict):
+                                                part_type = str(part.get("type") or "other")
+                                                part_text = part.get("text")
+                                            else:
+                                                part_type = str(getattr(part, "type", "other"))
+                                                part_text = getattr(part, "text", None)
+                                            if part_type == "text":
+                                                text_parts.append(str(part_text or ""))
+                                            else:
+                                                non_text_types.append(part_type)
+                                        tool_result_text = "\n".join(text_parts).strip()
+                                        if non_text_types:
+                                            tool_result_text = (
+                                                tool_result_text
+                                                + "\n"
+                                                + "非文本结果已省略："
+                                                + ", ".join(non_text_types)
+                                            ).strip()
+                                        events.append(
+                                            node_delta_event(
+                                                node_id, title, kind,
+                                                f"[{iteration_index + 1}/{max_iterations}] "
+                                                f"调用工具 {tool_name}，结果预览："
+                                                f"{tool_result_text[:300]}",
+                                                output_variable,
+                                            )
+                                        )
+                                    messages.append(
+                                        ChatMessage(
+                                            role="assistant",
+                                            content=json.dumps(
+                                                decision,
+                                                ensure_ascii=False,
+                                            ),
+                                        )
+                                    )
+                                    messages.append(
+                                        ChatMessage(
+                                            role="user",
+                                            content=(
+                                                f"工具 {tool_name} 的执行结果：\n"
+                                                f"{tool_result_text}\n\n"
+                                                "请继续用 JSON 决策下一步。"
+                                            ),
+                                        )
+                                    )
+                                else:
+                                    events.append(
+                                        node_delta_event(
+                                            node_id, title, kind,
+                                            f"Agent 达到最大循环次数 {max_iterations}，未得到最终答案。",
+                                            output_variable,
+                                        )
+                                    )
+                                    output = ""
+                                variables[output_variable] = output
+                                events.append(
+                                    node_delta_event(node_id, title, kind, output[:500], output_variable)
+                                )
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "human_intervention":
+                # Parallel engine does not support human_intervention yet:
+                # it needs to stream pending/heartbeat while waiting, which
+                # conflicts with the event-list model. Fall through to error.
+                events.append(
+                    error_event(
+                        node_id,
+                        title,
+                        kind,
+                        "并行引擎暂不支持人工介入节点，请使用串行引擎。",
+                    )
+                )
+            else:
+                # Parallel engine does not yet support this node type.
+                message = f"并行引擎暂不支持节点类型：{kind}"
+                logger.warning("Parallel engine unsupported node: %s", kind)
+                events.append(error_event(node_id, title, kind, message))
+
+            events.append(node_end_event(node_id, title, kind, output, variables))
+            return events, output, chosen_handle
+
+        try:
+            yield sse_payload(
+                {
+                    "event": "workflow_meta",
+                    "task_id": task_id,
+                    "ttl_seconds": WORKFLOW_TASK_TTL_SECONDS,
+                }
+            )
+            layers = build_layers(order, payload.workflow.edges)
+            for layer in layers:
+                layer = [nid for nid in layer if nid not in executed]
+                if not layer:
+                    continue
+                results = await asyncio.gather(
+                    *(run_node(nid) for nid in layer),
+                    return_exceptions=True,
+                )
+                for node_id, result in zip(layer, results):
+                    if isinstance(result, BaseException):
+                        yield sse_payload(error_event(node_id, None, None, str(result)))
+                        continue
+                    events, _, chosen_handle = result
+                    executed.add(node_id)
+                    for event in events:
+                        yield sse_payload(event)
+                    # Schedule downstream via edges (condition uses chosen_handle)
+                    next_edges = outgoing[node_id]
+                    if workflow_node_kind(nodes_by_id[node_id]) == "condition":
+                        matching = [
+                            edge for edge in next_edges
+                            if edge.sourceHandle == chosen_handle
+                        ]
+                        if not matching:
+                            matching = [
+                                edge for edge in next_edges if not edge.sourceHandle
+                            ][:1]
+                        next_edges = matching
+                    for edge in sorted(
+                        next_edges, key=lambda item: order_index[item.target]
+                    ):
+                        if edge.target not in executed:
+                            # downstream node may be in a later layer; nothing to do here
+                            pass
+            if not final_output:
+                final_output = next(reversed(variables.values()), "")
+            yield sse_payload({"event": "workflow_end", "final_output": final_output})
+        except Exception as exc:
+            logger.exception("Parallel workflow run failed")
+            yield sse_payload({"event": "error", "message": str(exc)})
+        finally:
+            workflow_task_store.pop(task_id, None)
+
     async def workflow_stream():
         variables: dict[str, str] = task_state["variables"]
         variable_types: dict[str, str] = task_state["variable_types"]
@@ -1561,17 +2580,13 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
                 output = ""
 
                 if kind == "input":
-                    variable_name = str(node.data.get("variableName") or "user_input")
-                    variables[variable_name] = variables.get(
-                        variable_name,
-                        variables.get("user_input", ""),
+                    node_events, output = run_input_events(
+                        node,
+                        variables,
+                        variable_types,
                     )
-                    declared_type = str(
-                        node.data.get("variableType") or "string"
-                    ).strip()
-                    if declared_type in {"string", "number", "object", "array"}:
-                        variable_types[variable_name] = declared_type
-                    output = variables[variable_name]
+                    for event in node_events:
+                        yield sse_payload(event)
 
                 elif kind == "llm":
                     model_id = str(node.data.get("modelId") or TEXT_FALLBACK_MODEL)
@@ -2873,8 +3888,16 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
         finally:
             workflow_task_store.pop(task_id, None)
 
+    engine = (
+        (payload.engine or os.getenv("WORKFLOW_ENGINE", "serial"))
+        .strip()
+        .lower()
+    )
+    stream_generator = (
+        run_workflow_parallel() if engine == "parallel" else workflow_stream()
+    )
     return StreamingResponse(
-        workflow_stream(),
+        stream_generator,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )

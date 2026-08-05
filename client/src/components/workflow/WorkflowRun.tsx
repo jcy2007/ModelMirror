@@ -54,6 +54,7 @@ export default function WorkflowRun({ definition }: WorkflowRunProps) {
     useState<PendingHumanIntervention | null>(null);
   const [humanInput, setHumanInput] = useState("");
   const [isResuming, setIsResuming] = useState(false);
+  const [parallel, setParallel] = useState(false);
 
   const finalOutput = useMemo(() => {
     for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -82,6 +83,7 @@ export default function WorkflowRun({ definition }: WorkflowRunProps) {
           inputs: {
             user_input: input,
           },
+          engine: parallel ? "parallel" : "serial",
         }),
       });
 
@@ -206,6 +208,30 @@ export default function WorkflowRun({ definition }: WorkflowRunProps) {
             onChange={(event) => setInput(event.target.value)}
             value={input}
           />
+        </label>
+
+        <label className="flex cursor-pointer items-center justify-between rounded-lg border border-white/10 bg-white/[0.045] px-3 py-2.5">
+          <span className="text-xs font-semibold text-slate-300">
+            并行执行
+            <span className="ml-1 font-normal text-slate-500">
+              （同层无依赖节点同时运行）
+            </span>
+          </span>
+          <button
+            aria-pressed={parallel}
+            className={`relative h-6 w-11 shrink-0 rounded-full transition ${
+              parallel ? "bg-brand-300" : "bg-white/15"
+            }`}
+            onClick={() => setParallel((current) => !current)}
+            role="switch"
+            type="button"
+          >
+            <span
+              className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${
+                parallel ? "left-[22px]" : "left-0.5"
+              }`}
+            />
+          </button>
         </label>
 
         <button
