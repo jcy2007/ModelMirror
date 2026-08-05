@@ -39,11 +39,16 @@ export type HttpRequestMethod = "GET" | "POST";
 
 export type ListOperationOperator = "length" | "join" | "first" | "last";
 
+export type VariableType = "string" | "number" | "object" | "array";
+
 export interface WorkflowNodeData extends Record<string, unknown> {
   kind: WorkflowNodeKind;
   title: string;
   description: string;
+  variableType?: VariableType;
   variableName?: string;
+  errorStrategy?: "fail" | "continue" | "retry";
+  retryCount?: string;
   modelId?: string;
   prompt?: string;
   outputVariable?: string;

@@ -21,6 +21,7 @@ import {
   type ConditionOperator,
   type HttpRequestMethod,
   type ListOperationOperator,
+  type VariableType,
   type WorkflowDefinition,
   type WorkflowEdge,
   type WorkflowNode,
@@ -470,13 +471,40 @@ function NodeConfig({ node, onChange, variables, onInsertVariable }: NodeConfigP
       </Field>
 
       {data.kind === "input" ? (
-        <Field label="输入变量名">
-          <input
-            className={textInputClass()}
-            onChange={(event) => update({ variableName: event.target.value })}
-            value={data.variableName ?? ""}
-          />
-        </Field>
+        <>
+          <Field
+            hint="输入节点的变量名，下游节点用这个名字引用。"
+            label="输入变量名"
+          >
+            <input
+              className={textInputClass()}
+              onChange={(event) => update({ variableName: event.target.value })}
+              value={data.variableName ?? ""}
+            />
+          </Field>
+          <Field hint="声明输入数据的类型，条件判断会按类型比较。" label="变量类型">
+            <select
+              className={textInputClass()}
+              onChange={(event) =>
+                update({ variableType: event.target.value as VariableType })
+              }
+              value={data.variableType ?? "string"}
+            >
+              <option className="bg-slate-950" value="string">
+                文本 string
+              </option>
+              <option className="bg-slate-950" value="number">
+                数字 number
+              </option>
+              <option className="bg-slate-950" value="object">
+                对象 object（JSON）
+              </option>
+              <option className="bg-slate-950" value="array">
+                数组 array（JSON）
+              </option>
+            </select>
+          </Field>
+        </>
       ) : null}
 
       {data.kind === "llm" ? (
@@ -518,6 +546,42 @@ function NodeConfig({ node, onChange, variables, onInsertVariable }: NodeConfigP
               value={data.outputVariable ?? ""}
             />
           </Field>
+          <MoreOptions label="失败处理">
+            <Field hint="模型调用失败时的处理方式。" label="失败策略">
+              <select
+                className={textInputClass()}
+                onChange={(event) =>
+                  update({
+                    errorStrategy: event.target.value as
+                      | "fail"
+                      | "continue"
+                      | "retry",
+                  })
+                }
+                value={data.errorStrategy ?? "fail"}
+              >
+                <option className="bg-slate-950" value="fail">
+                  失败即终止
+                </option>
+                <option className="bg-slate-950" value="retry">
+                  自动重试
+                </option>
+                <option className="bg-slate-950" value="continue">
+                  失败继续（写空值）
+                </option>
+              </select>
+            </Field>
+            {data.errorStrategy === "retry" ? (
+              <Field hint="失败后重试的次数。" label="重试次数">
+                <input
+                  className={textInputClass()}
+                  onChange={(event) => update({ retryCount: event.target.value })}
+                  type="number"
+                  value={data.retryCount ?? "1"}
+                />
+              </Field>
+            ) : null}
+          </MoreOptions>
         </>
       ) : null}
 
@@ -1428,12 +1492,27 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
       ...definition,
       updatedAt: new Date().toISOString(),
     };
+    // 始终写 localStorage（离线可用、兼容旧草稿）。
     window.localStorage.setItem(
       `${storagePrefix}${workflowId}`,
       JSON.stringify(savedDefinition),
     );
-    setSaveNotice("已保存到本地草稿箱");
-    window.setTimeout(() => setSaveNotice(""), 1800);
+    // 异步同步到后端，持久化跨设备。
+    fetch("/api/workflow/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(savedDefinition),
+    })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        setSaveNotice("已保存到云端草稿箱");
+      })
+      .catch(() => {
+        setSaveNotice("已保存到本地（云端同步失败）");
+      })
+      .finally(() => {
+        window.setTimeout(() => setSaveNotice(""), 1800);
+      });
   }
 
   function applyAutoLayout() {

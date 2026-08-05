@@ -51,6 +51,11 @@ except ModuleNotFoundError:
     from world.api import router as world_router
 
 try:
+    from server.workflow.api import router as workflow_store_router
+except ModuleNotFoundError:
+    from workflow.api import router as workflow_store_router
+
+try:
     from server.rag.document_parser import parse_document
     from server.rag.rag_service import RagService
 except ModuleNotFoundError:
@@ -171,6 +176,7 @@ app.include_router(rag_router)
 app.include_router(skills_router)
 app.include_router(workflow_native_router)
 app.include_router(world_router)
+app.include_router(workflow_store_router)
 
 request_windows: dict[str, deque[float]] = defaultdict(deque)
 mcp_connect_windows: dict[str, deque[float]] = defaultdict(deque)
@@ -1246,6 +1252,28 @@ def _try_number(value: str) -> float | None:
         return None
 
 
+def infer_variable_type(value: str) -> str:
+    """Best-effort type inference for a variable's string value.
+
+    Used at read time so existing string variables get typed behaviour
+    without rewriting every node's write site.
+    """
+
+    if not value.strip():
+        return "string"
+    if _try_number(value) is not None:
+        return "number"
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return "string"
+    if isinstance(parsed, list):
+        return "array"
+    if isinstance(parsed, dict):
+        return "object"
+    return "string"
+
+
 def condition_equals(actual: str, expected: str) -> bool:
     """Numeric-aware equality: when both sides parse as numbers, compare numerically."""
 
@@ -1260,6 +1288,8 @@ def condition_matches(
     operator: str,
     actual: str,
     expected: str,
+    *,
+    numeric_hint: bool = False,
 ) -> bool:
     """Evaluate a condition operator against (actual, expected).
 
@@ -1268,7 +1298,7 @@ def condition_matches(
       not_equals / ne  -> numeric-aware inequality
       contains         -> substring
       not_contains     -> not substring
-      gt / gte / lt / lte -> numeric comparison (falls back to string compare)
+      gt / gte / lt / lte -> numeric comparison when hint or both parse
       empty            -> actual is empty/whitespace
       not_empty        -> actual has content
     """
@@ -1473,6 +1503,11 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
     task_state: dict[str, Any] = {
         "task_id": task_id,
         "variables": {str(key): str(value) for key, value in payload.inputs.items()},
+        "variable_types": {
+            str(key): str(value.get("type", "string"))
+            for key, value in payload.inputs.items()
+            if isinstance(value, dict)
+        },
         "queue": initial_queue,
         "queued": set(initial_queue),
         "executed": set(),
@@ -1490,6 +1525,7 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
 
     async def workflow_stream():
         variables: dict[str, str] = task_state["variables"]
+        variable_types: dict[str, str] = task_state["variable_types"]
         queue: deque[str] = task_state["queue"]
         queued: set[str] = task_state["queued"]
         executed: set[str] = task_state["executed"]
@@ -1530,6 +1566,11 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
                         variable_name,
                         variables.get("user_input", ""),
                     )
+                    declared_type = str(
+                        node.data.get("variableType") or "string"
+                    ).strip()
+                    if declared_type in {"string", "number", "object", "array"}:
+                        variable_types[variable_name] = declared_type
                     output = variables[variable_name]
 
                 elif kind == "llm":
@@ -1539,26 +1580,86 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
                         variables,
                     )
                     output_variable = str(node.data.get("outputVariable") or "llm_output")
-                    async for delta in stream_workflow_llm_text(model_id, prompt):
-                        output += delta
-                        yield sse_payload(
-                            {
-                                "event": "node_delta",
-                                "node_id": node.id,
-                                "node_title": title,
-                                "node_type": kind,
-                                "output": delta,
-                                "variable": output_variable,
-                            }
+                    error_strategy = str(
+                        node.data.get("errorStrategy") or "fail"
+                    ).strip()
+                    try:
+                        retry_count = max(
+                            0, int(str(node.data.get("retryCount") or "1"))
                         )
-                    variables[output_variable] = output
+                    except ValueError:
+                        retry_count = 1
+                    attempt = 0
+                    while True:
+                        try:
+                            output = ""
+                            async for delta in stream_workflow_llm_text(model_id, prompt):
+                                output += delta
+                                yield sse_payload(
+                                    {
+                                        "event": "node_delta",
+                                        "node_id": node.id,
+                                        "node_title": title,
+                                        "node_type": kind,
+                                        "output": delta,
+                                        "variable": output_variable,
+                                    }
+                                )
+                            variables[output_variable] = output
+                            break
+                        except Exception as exc:
+                            attempt += 1
+                            if error_strategy == "retry" and attempt <= retry_count:
+                                logger.warning(
+                                    "Workflow llm node retry %d/%d: %s",
+                                    attempt,
+                                    retry_count,
+                                    exc,
+                                )
+                                yield sse_payload(
+                                    {
+                                        "event": "node_delta",
+                                        "node_id": node.id,
+                                        "node_title": title,
+                                        "node_type": kind,
+                                        "output": f"[重试 {attempt}/{retry_count}] {exc}",
+                                        "variable": output_variable,
+                                    }
+                                )
+                                continue
+                            if error_strategy == "continue":
+                                logger.warning(
+                                    "Workflow llm node failed (continue): %s", exc
+                                )
+                                variables[output_variable] = ""
+                                yield sse_payload(
+                                    {
+                                        "event": "error",
+                                        "node_id": node.id,
+                                        "node_title": title,
+                                        "node_type": kind,
+                                        "message": str(exc),
+                                    }
+                                )
+                                break
+                            # fail (default) — re-raise to stop the workflow
+                            raise
 
                 elif kind == "condition":
                     variable_name = str(node.data.get("conditionVariable") or "user_input")
                     operator = str(node.data.get("conditionOperator") or "contains")
                     expected = str(node.data.get("conditionValue") or "")
                     actual = variables.get(variable_name, "")
-                    matched = condition_matches(operator, actual, expected)
+                    declared_type = variable_types.get(variable_name, "")
+                    numeric_hint = declared_type == "number" or (
+                        infer_variable_type(actual) == "number"
+                    )
+                    matched = condition_matches(
+                        operator,
+                        actual,
+                        expected,
+                        numeric_hint=numeric_hint,
+                    )
                     chosen_handle = "true" if matched else "false"
                     output = f"{variable_name} {operator} {expected} -> {'是' if matched else '否'}"
 
