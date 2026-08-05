@@ -63,9 +63,19 @@ except ModuleNotFoundError:
     from workflow.api import router as workflow_store_router
 
 try:
-    from server.workflow.executors import run_pure_executor
+    from server.workflow.executors import (
+        execute_agent,
+        execute_llm,
+        run_io_executor,
+        run_pure_executor,
+    )
 except ModuleNotFoundError:
-    from workflow.executors import run_pure_executor
+    from workflow.executors import (
+        execute_agent,
+        execute_llm,
+        run_io_executor,
+        run_pure_executor,
+    )
 
 try:
     from server.rag.document_parser import parse_document
@@ -1698,7 +1708,7 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
             output = ""
             chosen_handle: str | None = None
 
-            # P2b/P2c: pure-compute and IO nodes use shared executors.
+            # P2b/P2c/P2d: pure-compute, IO, and llm nodes use shared executors.
             # If the kind is handled, produce events and return early so the
             # big if/elif chain below stays untouched (no structural risk).
             executor_output: str | None = None
@@ -1711,6 +1721,40 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
                 pure_result = None
             if pure_result is not None:
                 executor_output, executor_delta = pure_result
+            elif kind == "llm":
+                # P2d-3: llm uses a callback-based executor for streaming + retry.
+                llm_deltas: list[str] = []
+                llm_status: list[str] = []
+                try:
+                    llm_output, llm_error = await execute_llm(
+                        node,
+                        variables,
+                        on_delta=llm_deltas.append,
+                        on_status=llm_status.append,
+                    )
+                    executor_output = llm_output
+                    if llm_deltas:
+                        executor_delta = "".join(llm_deltas)
+                    if llm_error:
+                        executor_error = llm_error
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+            elif kind == "agent":
+                # P2d-4: agent uses a callback-based executor for tool progress.
+                agent_status: list[str] = []
+                try:
+                    agent_output, agent_error = await execute_agent(
+                        node,
+                        variables,
+                        on_status=agent_status.append,
+                    )
+                    executor_output = agent_output
+                    if agent_status:
+                        executor_delta = "; ".join(agent_status)
+                    if agent_error:
+                        executor_error = agent_error
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
             else:
                 try:
                     io_result = await run_io_executor(kind, node, variables)
@@ -2025,6 +2069,9 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
                         events.append(
                             node_delta_event(node_id, title, kind, output[:500], output_variable)
                         )
+                    # P2d-1: match serial engine — preserve the output variable
+                    # even on failure so downstream references don't silently miss.
+                    variables.setdefault(output_variable, output)
                 except Exception as exc:
                     events.append(error_event(node_id, title, kind, str(exc)))
             elif kind == "parameter_extractor":
