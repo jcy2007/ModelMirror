@@ -1499,7 +1499,7 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
               data: {
                 ...node.data,
                 ...patch,
-              },
+              } as WorkflowNodeData,
             }
           : node,
       ),
