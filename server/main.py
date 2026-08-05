@@ -46,6 +46,13 @@ except ModuleNotFoundError:
     from api.workflow_native import router as workflow_native_router
 
 try:
+    from server.workflow_native.schemas import NativeWorkflowDefinition
+    from server.workflow_native.validate import validate_workflow_graph
+except ModuleNotFoundError:
+    from workflow_native.schemas import NativeWorkflowDefinition
+    from workflow_native.validate import validate_workflow_graph
+
+try:
     from server.world.api import router as world_router
 except ModuleNotFoundError:
     from world.api import router as world_router
@@ -1584,6 +1591,29 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
         logger.exception("Workflow validation failed")
         return JSONResponse(status_code=500, content={"error": "工作流校验失败，请检查节点和连线。"})
 
+    # P0-3: Run full native validation before execution — catch node config
+    # and variable-reference errors early (was previously dead code).
+    try:
+        native_workflow = NativeWorkflowDefinition.model_validate(
+            payload.workflow.model_dump()
+        )
+        validation = validate_workflow_graph(native_workflow)
+        if not validation.valid:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "工作流校验未通过。",
+                    "issues": [
+                        issue.model_dump() for issue in validation.issues
+                    ],
+                },
+            )
+    except HTTPException as exc:
+        raise exc
+    except Exception:
+        logger.exception("Native workflow validation raised")
+        # Fall through — do not block execution on a validator bug.
+
     nodes_by_id = {node.id: node for node in payload.workflow.nodes}
     order_index = {node_id: index for index, node_id in enumerate(order)}
     outgoing: dict[str, list[WorkflowEdgePayload]] = defaultdict(list)
@@ -2499,8 +2529,19 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
                 }
             )
             layers = build_layers(order, payload.workflow.edges)
+            # Track condition-branch pruning across layers: when a condition
+            # node picks one branch, the other branch's nodes are skipped.
+            skipped: set[str] = set()
             for layer in layers:
-                layer = [nid for nid in layer if nid not in executed]
+                # Sync variables back to task_state after each layer so
+                # /status can observe progress (matches serial engine behavior).
+                task_state["variables"] = variables
+                task_state["variable_types"] = variable_types
+                layer = [
+                    nid
+                    for nid in layer
+                    if nid not in executed and nid not in skipped
+                ]
                 if not layer:
                     continue
                 results = await asyncio.gather(
@@ -2515,24 +2556,21 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
                     executed.add(node_id)
                     for event in events:
                         yield sse_payload(event)
-                    # Schedule downstream via edges (condition uses chosen_handle)
+                    # Condition pruning: when a condition node has explicit
+                    # true/false branch handles, only the chosen branch's
+                    # downstream nodes execute; the other branch is skipped.
                     next_edges = outgoing[node_id]
                     if workflow_node_kind(nodes_by_id[node_id]) == "condition":
-                        matching = [
-                            edge for edge in next_edges
-                            if edge.sourceHandle == chosen_handle
-                        ]
-                        if not matching:
-                            matching = [
-                                edge for edge in next_edges if not edge.sourceHandle
-                            ][:1]
-                        next_edges = matching
-                    for edge in sorted(
-                        next_edges, key=lambda item: order_index[item.target]
-                    ):
-                        if edge.target not in executed:
-                            # downstream node may be in a later layer; nothing to do here
-                            pass
+                        has_handles = any(
+                            edge.sourceHandle for edge in next_edges
+                        )
+                        if has_handles:
+                            for edge in next_edges:
+                                if (
+                                    edge.sourceHandle
+                                    and edge.sourceHandle != chosen_handle
+                                ):
+                                    skipped.add(edge.target)
             if not final_output:
                 final_output = next(reversed(variables.values()), "")
             yield sse_payload({"event": "workflow_end", "final_output": final_output})

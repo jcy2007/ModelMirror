@@ -6,6 +6,10 @@ import {
 
 interface WorkflowRunProps {
   definition: WorkflowDefinition;
+  onNodeStateChange?: (
+    nodeId: string,
+    state: "running" | "success" | "error",
+  ) => void;
 }
 
 interface PendingHumanIntervention {
@@ -44,7 +48,10 @@ function readSseEvent(eventText: string) {
     .filter(Boolean);
 }
 
-export default function WorkflowRun({ definition }: WorkflowRunProps) {
+export default function WorkflowRun({
+  definition,
+  onNodeStateChange,
+}: WorkflowRunProps) {
   const [input, setInput] = useState("请帮我把这个需求拆成三步执行计划。");
   const [events, setEvents] = useState<WorkflowRunEvent[]>([]);
   const [isRunning, setIsRunning] = useState(false);
@@ -64,6 +71,58 @@ export default function WorkflowRun({ definition }: WorkflowRunProps) {
     }
 
     return "";
+  }, [events]);
+
+  // P1-2: aggregate per-node events into a single card per node, with the
+  // node's deltas concatenated in order and its final state shown.
+  const nodeCards = useMemo(() => {
+    const byNode = new Map<
+      string,
+      {
+        nodeId: string;
+        title: string;
+        kind: string;
+        output: string;
+        state: "running" | "success" | "error" | "idle";
+      }
+    >();
+    let workflowOutput = "";
+
+    for (const event of events) {
+      if (event.event === "workflow_end") {
+        workflowOutput = event.final_output ?? "";
+        continue;
+      }
+      const nodeId = event.node_id ?? "workflow";
+      if (!byNode.has(nodeId)) {
+        byNode.set(nodeId, {
+          nodeId,
+          title: event.node_title ?? "节点",
+          kind: event.node_type ?? "unknown",
+          output: "",
+          state: "idle",
+        });
+      }
+      const card = byNode.get(nodeId)!;
+      if (event.event === "node_start") {
+        card.state = "running";
+      } else if (event.event === "node_delta" && event.output) {
+        card.output += event.output;
+      } else if (event.event === "node_end") {
+        card.state = "success";
+        if (event.output && !card.output) {
+          card.output = event.output;
+        }
+      } else if (event.event === "error") {
+        card.state = "error";
+        if (event.message) card.output = event.message;
+      }
+    }
+
+    return {
+      cards: Array.from(byNode.values()),
+      workflowOutput,
+    };
   }, [events]);
 
   async function runWorkflow() {
@@ -148,6 +207,15 @@ export default function WorkflowRun({ definition }: WorkflowRunProps) {
         outputVariable: event.output_variable ?? "human_input",
       });
       setHumanInput("");
+    }
+    if (event.event === "node_start" && event.node_id && onNodeStateChange) {
+      onNodeStateChange(event.node_id, "running");
+    }
+    if (event.event === "node_end" && event.node_id && onNodeStateChange) {
+      onNodeStateChange(event.node_id, "success");
+    }
+    if (event.event === "error" && event.node_id && onNodeStateChange) {
+      onNodeStateChange(event.node_id, "error");
     }
     if (event.event === "node_end") {
       setPendingHuman((current) =>
@@ -283,31 +351,60 @@ export default function WorkflowRun({ definition }: WorkflowRunProps) {
 
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
         <div className="space-y-2">
-          {events.length === 0 ? (
+          {nodeCards.cards.length === 0 ? (
             <div className="rounded-lg border border-dashed border-white/15 bg-white/[0.035] px-4 py-8 text-center text-sm leading-6 text-slate-400">
               暂无运行记录。点击“运行工作流”后，这里会像招聘会排班表一样逐项亮起。
             </div>
           ) : (
-            events.map((event, index) => (
-              <div
-                className="rounded-lg border border-white/10 bg-white/[0.045] px-3 py-2"
-                key={`${event.event}-${event.node_id ?? "workflow"}-${index}`}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-xs font-semibold text-slate-200">
-                    {event.node_title ?? "工作流"}
-                  </span>
-                  <span className="rounded-full border border-white/10 bg-white/[0.055] px-2 py-0.5 text-[11px] text-slate-400">
-                    {event.event}
-                  </span>
+            nodeCards.cards.map((card) => {
+              const stateStyles =
+                card.state === "running"
+                  ? "border-brand-300/50 bg-brand-300/10"
+                  : card.state === "success"
+                    ? "border-emerald-300/30 bg-emerald-300/5"
+                    : card.state === "error"
+                      ? "border-rose-300/40 bg-rose-300/10"
+                      : "border-white/10 bg-white/[0.045]";
+              const stateLabel =
+                card.state === "running"
+                  ? "运行中"
+                  : card.state === "success"
+                    ? "成功"
+                    : card.state === "error"
+                      ? "失败"
+                      : "等待";
+
+              return (
+                <div
+                  className={`rounded-lg border px-3 py-2 transition ${stateStyles}`}
+                  key={card.nodeId}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="truncate text-xs font-semibold text-slate-200">
+                      {card.title}
+                    </span>
+                    <span
+                      className={`shrink-0 rounded-full border px-2 py-0.5 text-[11px] ${
+                        card.state === "running"
+                          ? "border-brand-300/30 bg-brand-300/10 text-brand-100"
+                          : card.state === "success"
+                            ? "border-emerald-300/30 bg-emerald-300/10 text-emerald-100"
+                            : card.state === "error"
+                              ? "border-rose-300/30 bg-rose-300/10 text-rose-100"
+                              : "border-white/10 bg-white/[0.055] text-slate-400"
+                      }`}
+                    >
+                      {stateLabel}
+                    </span>
+                  </div>
+                  {card.output ? (
+                    <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-slate-300">
+                      {card.output}
+                    </p>
+                  ) : null}
                 </div>
-                {event.output || event.final_output || event.message || event.prompt ? (
-                  <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-slate-300">
-                    {event.output ?? event.final_output ?? event.message ?? event.prompt}
-                  </p>
-                ) : null}
-              </div>
-            ))
+              );
+            })
           )}
         </div>
       </div>

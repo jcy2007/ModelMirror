@@ -1398,6 +1398,25 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
   );
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [saveNotice, setSaveNotice] = useState("");
+  // P1-1: runtime node states (running/success/error) mapped to the canvas.
+  const [nodeRunStates, setNodeRunStates] = useState<
+    Record<string, "running" | "success" | "error">
+  >({});
+
+  const handleNodeStateChange = useCallback(
+    (nodeId: string, state: "running" | "success" | "error") => {
+      setNodeRunStates((current) => ({ ...current, [nodeId]: state }));
+      // Reflect the state on the node's data so WorkflowNodeCard can render it.
+      setNodes((currentNodes) =>
+        currentNodes.map((node) =>
+          node.id === nodeId
+            ? { ...node, data: { ...node.data, runState: state } }
+            : node,
+        ),
+      );
+    },
+    [setNodes],
+  );
   const { screenToFlowPosition } = useReactFlow();
 
   const definition = useMemo<WorkflowDefinition>(
@@ -1532,6 +1551,8 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
     const kind = event.dataTransfer.getData(
       "application/modelmirror-node",
     ) as WorkflowNodeKind;
+    // eslint-disable-next-line no-console
+    console.debug("[workflow] onDrop", { kind, clientX: event.clientX });
     if (!kind) return;
 
     const position = screenToFlowPosition({
@@ -1541,6 +1562,8 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
     const nextNode = createNode(kind, position.x, position.y);
     setNodes((currentNodes) => [...currentNodes, nextNode]);
     setSelectedNodeId(nextNode.id);
+    // eslint-disable-next-line no-console
+    console.debug("[workflow] created node", nextNode.id, kind);
   }
 
   useEffect(() => {
@@ -1561,7 +1584,7 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
         </div>
       </aside>
 
-      <section className="min-w-0 overflow-hidden rounded-lg border border-white/10 bg-ink-950/80 shadow-prism">
+      <section className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-white/10 bg-ink-950/80 shadow-prism">
         <div className="flex flex-col gap-3 border-b border-white/10 bg-surface-900/90 p-4 lg:flex-row lg:items-center lg:justify-between">
           <div className="min-w-0">
             <input
@@ -1597,7 +1620,7 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
         </div>
 
         <div
-          className="h-[640px] min-h-[520px]"
+          className="min-h-[520px] flex-1"
           onDragOver={(event) => {
             event.preventDefault();
             event.dataTransfer.dropEffect = "move";
@@ -1653,7 +1676,10 @@ function WorkflowCanvas({ workflowId }: WorkflowCanvasProps) {
           </div>
         </section>
 
-        <WorkflowRun definition={definition} />
+        <WorkflowRun
+          definition={definition}
+          onNodeStateChange={handleNodeStateChange}
+        />
       </aside>
     </div>
   );

@@ -17,6 +17,7 @@ COPY rag ./rag
 COPY skills ./skills
 COPY workflow_native ./workflow_native
 COPY world ./world
+COPY workflow ./workflow
 
 EXPOSE 8000
 

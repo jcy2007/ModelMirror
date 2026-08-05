@@ -195,9 +195,15 @@ export default function WorkflowNodeCard({ data, selected }: NodeProps<WorkflowN
   return (
     <div
       className={`relative min-w-56 rounded-lg border bg-surface-900/95 p-3 text-slate-100 shadow-prism backdrop-blur-xl transition duration-200 ${
-        selected
-          ? "border-hire-200/70 ring-4 ring-hire-300/15"
-          : meta.border
+        data.runState === "running"
+          ? "border-brand-300/80 ring-4 ring-brand-300/30"
+          : data.runState === "success"
+            ? "border-emerald-300/70 ring-2 ring-emerald-300/20"
+            : data.runState === "error"
+              ? "border-rose-300/70 ring-2 ring-rose-300/25"
+              : selected
+                ? "border-hire-200/70 ring-4 ring-hire-300/15"
+                : meta.border
       }`}
     >
       {data.kind !== "input" ? (

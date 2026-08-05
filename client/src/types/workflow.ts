@@ -49,6 +49,7 @@ export interface WorkflowNodeData extends Record<string, unknown> {
   variableName?: string;
   errorStrategy?: "fail" | "continue" | "retry";
   retryCount?: string;
+  runState?: "running" | "success" | "error";
   modelId?: string;
   prompt?: string;
   outputVariable?: string;
