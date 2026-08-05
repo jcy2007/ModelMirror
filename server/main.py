@@ -63,6 +63,11 @@ except ModuleNotFoundError:
     from workflow.api import router as workflow_store_router
 
 try:
+    from server.workflow.executors import run_pure_executor
+except ModuleNotFoundError:
+    from workflow.executors import run_pure_executor
+
+try:
     from server.rag.document_parser import parse_document
     from server.rag.rag_service import RagService
 except ModuleNotFoundError:
@@ -1692,6 +1697,38 @@ async def run_workflow(payload: WorkflowRunRequest, request: Request):
             events: NodeEventList = [node_start_event(node_id, title, kind)]
             output = ""
             chosen_handle: str | None = None
+
+            # P2b/P2c: pure-compute and IO nodes use shared executors.
+            # If the kind is handled, produce events and return early so the
+            # big if/elif chain below stays untouched (no structural risk).
+            executor_output: str | None = None
+            executor_delta: str | None = None
+            executor_error: str | None = None
+            try:
+                pure_result = run_pure_executor(kind, node, variables)
+            except Exception as exc:
+                events.append(error_event(node_id, title, kind, str(exc)))
+                pure_result = None
+            if pure_result is not None:
+                executor_output, executor_delta = pure_result
+            else:
+                try:
+                    io_result = await run_io_executor(kind, node, variables)
+                except Exception as exc:
+                    events.append(error_event(node_id, title, kind, str(exc)))
+                    io_result = None
+                if io_result is not None:
+                    executor_output, executor_delta, executor_error = io_result
+            if executor_output is not None:
+                output = executor_output
+                if executor_delta:
+                    events.append(
+                        node_delta_event(node_id, title, kind, executor_delta, "")
+                    )
+                if executor_error:
+                    events.append(error_event(node_id, title, kind, executor_error))
+                events.append(node_end_event(node_id, title, kind, output, variables))
+                return events, output, chosen_handle
 
             if kind == "input":
                 _, output = run_input_events(node, variables, variable_types)
